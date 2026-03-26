@@ -55,10 +55,10 @@ function ENT:Init()
     self.GekkoRGunBone      = self:LookupBone("b_r_gunrack")
     self.GekkoBarrelOffset  = 28
     self.GekkoLastStepSound = 0
-    self.GekkoLastSeq       = -1
     self.GekkoDebugT        = 0
-    -- Smoothed local pitch stored between frames (degrees)
     self.GekkoCurPitch      = 0
+    -- Gun alternation: fire left then right on alternate attacks
+    self.GekkoGunToggle     = false
 
     print("[GekkoNPC] Spine4 bone idx:   ", self.GekkoSpineBone)
     print("[GekkoNPC] L_gunrack bone idx:", self.GekkoLGunBone)
@@ -69,22 +69,16 @@ function ENT:Init()
 end
 
 -- ============================================================
---  AIM BONE — local-space pitch only, smoothed, yaw locked to 0
+--  AIM BONE — local-space pitch delta only, yaw locked to 0
 --
---  THE BUG THAT WAS HERE:
---    worldAng.p was fed directly into ManipulateBoneAngles.
---    ManipulateBoneAngles expects a LOCAL delta from the bone's
---    rest pose, not a world-space angle.  In combat the NPC body
---    yaw diverges from the enemy, so the injected world pitch
---    is in the wrong frame → the bone fights the body-turn system
---    and spins hard to the left.
+--  ManipulateBoneAngles expects a LOCAL offset from the bone rest
+--  pose. Injecting a raw world-space angle here (as the first
+--  version did) puts the delta in the wrong frame the moment the
+--  NPC body yaw diverges from the enemy — causing the spin-fight.
 --
---  FIX:
---    1. Get bone world angle from its matrix.
---    2. Compute the world-space angle we WANT the bone to face.
---    3. Subtract current bone world angle to get a LOCAL delta.
---    4. Apply ONLY the pitch component of that delta (lock yaw=0, roll=0).
---    5. Clamp and smooth so it can't snap or spiral.
+--  Fix: subtract the bone's own world angle from the desired world
+--  angle to get a true local delta, then apply only the pitch
+--  component (yaw=0 so the spine never fights the body-turn system).
 -- ============================================================
 function ENT:GekkoUpdateAimAngle()
     local bone = self.GekkoSpineBone
@@ -92,7 +86,6 @@ function ENT:GekkoUpdateAimAngle()
 
     local enemy = self:GetEnemy()
     if not IsValid(enemy) then
-        -- Decay back to rest smoothly
         self.GekkoCurPitch = self.GekkoCurPitch * 0.85
         if math.abs(self.GekkoCurPitch) < 0.1 then self.GekkoCurPitch = 0 end
         self:ManipulateBoneAngles(bone, Angle(self.GekkoCurPitch, 0, 0))
@@ -102,76 +95,58 @@ function ENT:GekkoUpdateAimAngle()
     local matrix = self:GetBoneMatrix(bone)
     if not matrix then return end
 
-    -- World direction from bone to enemy eye level
     local bonePos    = matrix:GetTranslation()
     local targetPos  = enemy:GetPos() + Vector(0, 0, 40)
-    local toEnemy    = (targetPos - bonePos):GetNormalized()
-    local desiredAng = toEnemy:Angle()          -- world-space desired
+    local desiredAng = (targetPos - bonePos):GetNormalized():Angle()
+    local boneAng    = matrix:GetAngles()
 
-    -- Current bone world angle
-    local boneAng = matrix:GetAngles()          -- world-space current
-
-    -- Delta in world space → extract only pitch
     local pitchDelta = desiredAng.p - boneAng.p
-
-    -- Normalise to [-180, 180]
     pitchDelta = ((pitchDelta + 180) % 360) - 180
-
-    -- Clamp to a sane arc (spine can't bend infinitely)
     pitchDelta = math.Clamp(pitchDelta, -40, 40)
 
-    -- Smooth (lerp toward target at ~10°/frame equivalent)
-    local alpha = FrameTime() * 6   -- tune speed here
+    local alpha = FrameTime() * 6
     self.GekkoCurPitch = self.GekkoCurPitch + (pitchDelta - self.GekkoCurPitch) * math.Clamp(alpha, 0, 1)
 
-    -- Yaw=0, Roll=0 — only pitch, no fighting the body-turn system
     self:ManipulateBoneAngles(bone, Angle(self.GekkoCurPitch, 0, 0))
 end
 
 -- ============================================================
---  Helper: barrel world position
+--  Helper: get world position + forward direction from a bone
 -- ============================================================
-local function GetBarrelPos(ent, boneIdx, offset)
-    if not boneIdx or boneIdx < 0 then return nil end
+local function GetMuzzleData(ent, boneIdx, offset)
+    if not boneIdx or boneIdx < 0 then return nil, nil end
     local matrix = ent:GetBoneMatrix(boneIdx)
-    if not matrix then return nil end
-    return matrix:GetTranslation() + matrix:GetForward() * offset
+    if not matrix then return nil, nil end
+    local fwd = matrix:GetForward()
+    local pos = matrix:GetTranslation() + fwd * offset
+    return pos, fwd
 end
 
 -- ============================================================
 --  THINK
+--
+--  PlaySequence was removed here.  It calls ResetSequence
+--  internally which snaps model cycle to 0 every frame it fires,
+--  creating the afterimage/convulsion effect when velocity
+--  repeatedly crossed the threshold.  VJ Base drives sequences
+--  correctly through TranslateActivity + AnimationTranslations
+--  — let it do its job.  OnThink only handles aim + step SFX.
 -- ============================================================
 function ENT:OnThink()
     self:GekkoUpdateAimAngle()
 
-    local vel    = self:GetVelocity():Length()
-    local curSeq = self:GetSequence()
+    local vel = self:GetVelocity():Length()
 
     if CurTime() > self.GekkoDebugT then
         print(string.format(
-            "[GekkoDBG] vel=%.1f curSeq=%d curAct=%d idealAct=%d IsGoalActive=%s IsMoving=%s",
-            vel, curSeq,
+            "[GekkoDBG] vel=%.1f seq=%d act=%d idealAct=%d moving=%s",
+            vel,
+            self:GetSequence(),
             self:GetActivity(),
             self:GetIdealActivity(),
-            tostring(self:IsGoalActive()),
             tostring(self:IsMoving())
         ))
         self.GekkoDebugT = CurTime() + 0.5
-    end
-
-    local targetSeq
-    if vel > 160 then
-        targetSeq = self.GekkoSeq_Run
-    elseif vel > 10 then
-        targetSeq = self.GekkoSeq_Walk
-    end
-
-    if targetSeq and targetSeq ~= self.GekkoLastSeq then
-        self:PlaySequence(targetSeq)
-        self.GekkoLastSeq = targetSeq
-        print("[GekkoDBG] PlaySequence ->", targetSeq)
-    elseif not targetSeq and self.GekkoLastSeq ~= -1 and vel == 0 then
-        self.GekkoLastSeq = -1
     end
 
     if vel > 10 and CurTime() > (self.GekkoLastStepSound or 0) + 0.38 then
@@ -181,39 +156,58 @@ function ENT:OnThink()
 end
 
 -- ============================================================
---  RANGE ATTACK EXECUTE
+--  RANGE ATTACK
+--
+--  Restored from original vehicle weapon_machinegun_mgs4.lua:
+--  - Fires one projectile entity (ma1_proj_machinegun_lvl1) per
+--    burst from the exact gun bone muzzle position + forward
+--  - Alternates left/right gun per attack call (like the vehicle)
+--  - Particle muzzle flash attached at bone origin
+--  - Falls back to center-mass only if both bones are invalid
 -- ============================================================
 function ENT:OnRangeAttackExecute(status, enemy, projectile)
     if status ~= "Init" then return end
+    if not SERVER then return end
+    if not IsValid(enemy) then return end
+
     local offset = self.GekkoBarrelOffset or 28
 
-    local function FireBurst(src)
-        if not IsValid(enemy) then return end
-        local dir = (enemy:GetPos() + Vector(0, 0, 40) - src):GetNormalized()
-        self:FireBullets({
-            Attacker   = self,
-            Damage     = 8,
-            Dir        = dir,
-            Src        = src,
-            AmmoType   = "AR2",
-            TracerName = "Tracer",
-            Num        = 3,
-            Spread     = Vector(0.05, 0.05, 0),
-        })
+    -- Alternate guns each attack exactly like the vehicle does
+    self.GekkoGunToggle = not self.GekkoGunToggle
+    local boneIdx = self.GekkoGunToggle and self.GekkoLGunBone or self.GekkoRGunBone
+
+    local muzzlePos, muzzleFwd = GetMuzzleData(self, boneIdx, offset)
+
+    -- Fallback: fire from chest height if bone lookup failed
+    if not muzzlePos then
+        muzzlePos = self:GetPos() + Vector(0, 0, 180)
+        muzzleFwd = (enemy:GetPos() + Vector(0, 0, 40) - muzzlePos):GetNormalized()
+    end
+
+    -- Direction: lead toward enemy (simple direct aim for NPC)
+    local aimDir = (enemy:GetPos() + Vector(0, 0, 40) - muzzlePos):GetNormalized()
+
+    -- Spawn the same projectile the vehicle uses
+    local proj = ents.Create("ma1_proj_machinegun_lvl1")
+    if IsValid(proj) then
+        proj:SetPos(muzzlePos)
+        proj:SetAngles(aimDir:Angle())
+        proj:SetOwner(self)
+        proj.Player = self   -- ma2_proj uses .Player for attacker
+        proj:Spawn()
+        proj:Activate()
+    end
+
+    -- Muzzle flash particle at bone origin (no offset, looks right)
+    local flashPos, _ = GetMuzzleData(self, boneIdx, 0)
+    if flashPos then
         local eff = EffectData()
-        eff:SetOrigin(src)
-        eff:SetNormal(dir)
+        eff:SetOrigin(flashPos)
+        eff:SetNormal(muzzleFwd or aimDir)
         util.Effect("MuzzleFlash", eff)
     end
 
-    local fired = false
-    for _, boneIdx in ipairs({self.GekkoLGunBone, self.GekkoRGunBone}) do
-        local pos = GetBarrelPos(self, boneIdx, offset)
-        if pos then FireBurst(pos) fired = true end
-    end
-    if not fired then FireBurst(self:GetPos() + Vector(0, 0, 200)) end
-
-    self:EmitSound("weapons/ar2/fire1.wav", 80, math.random(90, 110))
+    self:EmitSound("MA1_Weapon.Machinegun1", 80, math.random(95, 105))
     return true
 end
 
