@@ -39,12 +39,8 @@ end
 
 -- ============================================================
 --  INIT
---  CRITICAL: Hull must match collision bounds.
---  Vector(-24,-24,0) to Vector(24,24,72) = HULL_HUMAN dimensions.
---  Tall bounds (256) blocked every nav node traversal.
 -- ============================================================
 function ENT:Init()
-    -- Match HULL_HUMAN exactly so nav mesh traversal succeeds
     self:SetCollisionBounds(Vector(-24, -24, 0), Vector(24, 24, 72))
     self:SetSkin(1)
     self:SetMoveType(MOVETYPE_STEP)
@@ -61,6 +57,8 @@ function ENT:Init()
     self.GekkoLastStepSound = 0
     self.GekkoLastSeq       = -1
     self.GekkoDebugT        = 0
+    -- Smoothed local pitch stored between frames (degrees)
+    self.GekkoCurPitch      = 0
 
     print("[GekkoNPC] Spine4 bone idx:   ", self.GekkoSpineBone)
     print("[GekkoNPC] L_gunrack bone idx:", self.GekkoLGunBone)
@@ -71,20 +69,63 @@ function ENT:Init()
 end
 
 -- ============================================================
---  AIM BONE — pitch only
+--  AIM BONE — local-space pitch only, smoothed, yaw locked to 0
+--
+--  THE BUG THAT WAS HERE:
+--    worldAng.p was fed directly into ManipulateBoneAngles.
+--    ManipulateBoneAngles expects a LOCAL delta from the bone's
+--    rest pose, not a world-space angle.  In combat the NPC body
+--    yaw diverges from the enemy, so the injected world pitch
+--    is in the wrong frame → the bone fights the body-turn system
+--    and spins hard to the left.
+--
+--  FIX:
+--    1. Get bone world angle from its matrix.
+--    2. Compute the world-space angle we WANT the bone to face.
+--    3. Subtract current bone world angle to get a LOCAL delta.
+--    4. Apply ONLY the pitch component of that delta (lock yaw=0, roll=0).
+--    5. Clamp and smooth so it can't snap or spiral.
 -- ============================================================
 function ENT:GekkoUpdateAimAngle()
     local bone = self.GekkoSpineBone
     if not bone or bone < 0 then return end
+
     local enemy = self:GetEnemy()
     if not IsValid(enemy) then
-        self:ManipulateBoneAngles(bone, Angle(0, 0, 0))
+        -- Decay back to rest smoothly
+        self.GekkoCurPitch = self.GekkoCurPitch * 0.85
+        if math.abs(self.GekkoCurPitch) < 0.1 then self.GekkoCurPitch = 0 end
+        self:ManipulateBoneAngles(bone, Angle(self.GekkoCurPitch, 0, 0))
         return
     end
+
     local matrix = self:GetBoneMatrix(bone)
     if not matrix then return end
-    local worldAng = (enemy:GetPos() + Vector(0, 0, 40) - matrix:GetTranslation()):Angle()
-    self:ManipulateBoneAngles(bone, Angle(worldAng.p, 0, 0))
+
+    -- World direction from bone to enemy eye level
+    local bonePos    = matrix:GetTranslation()
+    local targetPos  = enemy:GetPos() + Vector(0, 0, 40)
+    local toEnemy    = (targetPos - bonePos):GetNormalized()
+    local desiredAng = toEnemy:Angle()          -- world-space desired
+
+    -- Current bone world angle
+    local boneAng = matrix:GetAngles()          -- world-space current
+
+    -- Delta in world space → extract only pitch
+    local pitchDelta = desiredAng.p - boneAng.p
+
+    -- Normalise to [-180, 180]
+    pitchDelta = ((pitchDelta + 180) % 360) - 180
+
+    -- Clamp to a sane arc (spine can't bend infinitely)
+    pitchDelta = math.Clamp(pitchDelta, -40, 40)
+
+    -- Smooth (lerp toward target at ~10°/frame equivalent)
+    local alpha = FrameTime() * 6   -- tune speed here
+    self.GekkoCurPitch = self.GekkoCurPitch + (pitchDelta - self.GekkoCurPitch) * math.Clamp(alpha, 0, 1)
+
+    -- Yaw=0, Roll=0 — only pitch, no fighting the body-turn system
+    self:ManipulateBoneAngles(bone, Angle(self.GekkoCurPitch, 0, 0))
 end
 
 -- ============================================================
@@ -98,7 +139,7 @@ local function GetBarrelPos(ent, boneIdx, offset)
 end
 
 -- ============================================================
---  THINK — sequence driven by PlaySequence after vel change
+--  THINK
 -- ============================================================
 function ENT:OnThink()
     self:GekkoUpdateAimAngle()
@@ -118,7 +159,6 @@ function ENT:OnThink()
         self.GekkoDebugT = CurTime() + 0.5
     end
 
-    -- Drive sequence via PlaySequence (sets ACT_DO_NOT_DISTURB so engine won't override)
     local targetSeq
     if vel > 160 then
         targetSeq = self.GekkoSeq_Run
@@ -131,7 +171,7 @@ function ENT:OnThink()
         self.GekkoLastSeq = targetSeq
         print("[GekkoDBG] PlaySequence ->", targetSeq)
     elseif not targetSeq and self.GekkoLastSeq ~= -1 and vel == 0 then
-        self.GekkoLastSeq = -1  -- Let VJ handle idle normally
+        self.GekkoLastSeq = -1
     end
 
     if vel > 10 and CurTime() > (self.GekkoLastStepSound or 0) + 0.38 then
